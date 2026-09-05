@@ -7,7 +7,6 @@ from numba import njit
 MATERIAL = np.array([100, 320, 330, 500, 900, 0], dtype=np.int32)
 # index = piece_type - 1: 0=pawn 1=knight 2=bishop 3=rook 4=queen 5=king
 
-MOBILITY_WEIGHT = 4
 BISHOP_PAIR_BONUS: np.int32 = np.int32(30)
 
 # ---------------------------------------------------------------------------
@@ -55,7 +54,7 @@ _PST_VIEW: list[list[int]] = [
     # ROOK (pt=3) — 7th rank, central files
     [
          5, 10, 10, 10, 10, 10, 10,  5,
-        -5,  0,  0,  0,  0,  0,  0, -5,
+        15, 15, 15, 15, 15, 15, 15, 15,   # rank 7 bonus
         -5,  0,  0,  0,  0,  0,  0, -5,
         -5,  0,  0,  0,  0,  0,  0, -5,
         -5,  0,  0,  0,  0,  0,  0, -5,
@@ -141,6 +140,7 @@ for _sq in range(64):
 
 DOUBLED_PAWN_PENALTY: np.int32 = np.int32(20)
 ISOLATED_PAWN_PENALTY: np.int32 = np.int32(15)
+CONNECTED_PASSED_BONUS: np.int32 = np.int32(40)
 ROOK_OPEN_FILE_BONUS: np.int32 = np.int32(25)
 ROOK_SEMI_OPEN_BONUS: np.int32 = np.int32(12)
 KING_PAWN_SHIELD_BONUS: np.int32 = np.int32(10)
@@ -178,6 +178,21 @@ for _sq in range(64):
     KING_SHIELD_MASK[0, _sq] = np.uint64(_wm)
     KING_SHIELD_MASK[1, _sq] = np.uint64(_bm)
 
+# King attack zone: 5x5 area centred on the king square (Chebyshev distance ≤ 2).
+# Enemy pieces physically inside this zone are counted as potential attackers.
+# Using proximity avoids per-piece sliding attack generation inside evaluate(),
+# which would make quiescence search ~3x slower.
+KING_ZONE: np.ndarray = np.zeros(64, dtype=np.uint64)
+for _sq in range(64):
+    _f, _r = _sq % 8, _sq // 8
+    _m = 0
+    for _dr in range(-2, 3):
+        for _df in range(-2, 3):
+            _nf, _nr = _f + _df, _r + _dr
+            if 0 <= _nf <= 7 and 0 <= _nr <= 7:
+                _m |= 1 << (_nr * 8 + _nf)
+    KING_ZONE[_sq] = np.uint64(_m)
+
 
 @njit(cache=False)
 def popcount(bb: np.uint64) -> int:
@@ -212,7 +227,7 @@ def encode(board: chess.Board) -> tuple[np.ndarray, int]:
 
 
 @njit(cache=False)
-def evaluate(bbs: np.ndarray, stm: int, mobility: int) -> int:
+def evaluate(bbs: np.ndarray, stm: int) -> int:
     opp = 1 - stm
     phase = _game_phase(bbs)
     score = 0
@@ -249,11 +264,13 @@ def evaluate(bbs: np.ndarray, stm: int, mobility: int) -> int:
 
     # Passed pawns
     their_pawns = bbs[opp][0]
+    stm_passed_bb = np.uint64(0)
     bb = bbs[stm][0]
     while bb:
         lsb = bb & (~bb + np.uint64(1))
         sq = popcount(lsb - np.uint64(1))
         if (their_pawns & PASSED_PAWN_MASK[stm, sq]) == np.uint64(0):
+            stm_passed_bb |= lsb
             rank = sq // 8
             advance = (rank - 1) if stm == 0 else (6 - rank)
             if 0 <= advance < 6:
@@ -261,16 +278,36 @@ def evaluate(bbs: np.ndarray, stm: int, mobility: int) -> int:
         bb ^= lsb
 
     our_pawns = bbs[stm][0]
+    opp_passed_bb = np.uint64(0)
     bb = bbs[opp][0]
     while bb:
         lsb = bb & (~bb + np.uint64(1))
         sq = popcount(lsb - np.uint64(1))
         if (our_pawns & PASSED_PAWN_MASK[opp, sq]) == np.uint64(0):
+            opp_passed_bb |= lsb
             rank = sq // 8
             advance = (rank - 1) if opp == 0 else (6 - rank)
             if 0 <= advance < 6:
                 score -= int(PASSED_PAWN_BONUS[advance])
         bb ^= lsb
+
+    # Connected passed pawns: bonus per pair on adjacent files
+    temp = stm_passed_bb
+    while temp:
+        lsb = temp & (~temp + np.uint64(1))
+        sq = popcount(lsb - np.uint64(1))
+        fi = sq % 8
+        if fi > 0 and (stm_passed_bb & FILE_MASKS[fi - 1]):
+            score += int(CONNECTED_PASSED_BONUS)
+        temp ^= lsb
+    temp = opp_passed_bb
+    while temp:
+        lsb = temp & (~temp + np.uint64(1))
+        sq = popcount(lsb - np.uint64(1))
+        fi = sq % 8
+        if fi > 0 and (opp_passed_bb & FILE_MASKS[fi - 1]):
+            score -= int(CONNECTED_PASSED_BONUS)
+        temp ^= lsb
 
     # Bishop pair
     if popcount(bbs[stm][2]) >= 2:
@@ -279,7 +316,6 @@ def evaluate(bbs: np.ndarray, stm: int, mobility: int) -> int:
         score -= int(BISHOP_PAIR_BONUS)
 
     # ---- Pawn structure: doubled and isolated ----
-    # our_pawns / their_pawns already defined above in the passed-pawn section.
     for fi in range(8):
         file_mask = FILE_MASKS[fi]
         adj_mask = ADJACENT_FILES[fi]
@@ -322,12 +358,15 @@ def evaluate(bbs: np.ndarray, stm: int, mobility: int) -> int:
         bb ^= lsb
 
     # ---- King safety: pawn shield + open files near king (tapered by phase) ----
+    our_ksq = -1
+    opp_ksq = -1
+
     bb = bbs[stm][5]
     if bb:
         lsb = bb & (~bb + np.uint64(1))
-        ksq = popcount(lsb - np.uint64(1))
-        pawn_cover = popcount(our_pawns & KING_SHIELD_MASK[stm, ksq])
-        kf = ksq % 8
+        our_ksq = popcount(lsb - np.uint64(1))
+        pawn_cover = popcount(our_pawns & KING_SHIELD_MASK[stm, our_ksq])
+        kf = our_ksq % 8
         open_near = 0
         for dfi in range(-1, 2):
             fi = kf + dfi
@@ -339,9 +378,9 @@ def evaluate(bbs: np.ndarray, stm: int, mobility: int) -> int:
     bb = bbs[opp][5]
     if bb:
         lsb = bb & (~bb + np.uint64(1))
-        ksq = popcount(lsb - np.uint64(1))
-        pawn_cover = popcount(their_pawns & KING_SHIELD_MASK[opp, ksq])
-        kf = ksq % 8
+        opp_ksq = popcount(lsb - np.uint64(1))
+        pawn_cover = popcount(their_pawns & KING_SHIELD_MASK[opp, opp_ksq])
+        kf = opp_ksq % 8
         open_near = 0
         for dfi in range(-1, 2):
             fi = kf + dfi
@@ -350,11 +389,34 @@ def evaluate(bbs: np.ndarray, stm: int, mobility: int) -> int:
         ks = pawn_cover * int(KING_PAWN_SHIELD_BONUS) - open_near * int(KING_OPEN_FILE_PENALTY)
         score -= ks * phase // 24
 
-    return score + MOBILITY_WEIGHT * mobility
+    # ---- King attack zone: count enemy pieces within 2 squares of the king ----
+    # Linear scaling (not squared) keeps the bonus proportional to attacker count.
+    # Weights: N=2, B=2, R=3, Q=5; multiplied by 8 and tapered by phase.
+    if opp_ksq >= 0:
+        zone = KING_ZONE[opp_ksq]
+        danger = (
+            popcount(bbs[stm][1] & zone) * 2
+            + popcount(bbs[stm][2] & zone) * 2
+            + popcount(bbs[stm][3] & zone) * 3
+            + popcount(bbs[stm][4] & zone) * 5
+        )
+        score += danger * 8 * phase // 24
+
+    if our_ksq >= 0:
+        zone = KING_ZONE[our_ksq]
+        danger = (
+            popcount(bbs[opp][1] & zone) * 2
+            + popcount(bbs[opp][2] & zone) * 2
+            + popcount(bbs[opp][3] & zone) * 3
+            + popcount(bbs[opp][4] & zone) * 5
+        )
+        score -= danger * 8 * phase // 24
+
+    return score
 
 
 # Warm all JIT functions at import — compilation lands in the 90 s init budget.
 _bbs, _stm = encode(chess.Board())
 popcount(np.uint64(0xFFFF))
 _game_phase(_bbs)
-evaluate(_bbs, _stm, 20)
+evaluate(_bbs, _stm)

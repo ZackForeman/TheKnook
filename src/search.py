@@ -1,4 +1,4 @@
-"""Negamax search: alpha-beta, ID, aspiration windows, NMP, IID, killers, LMR, SE, check ext."""
+"""Negamax search: alpha-beta, ID, aspiration, NMP, IID, killers, history, LMR, futility, SE."""
 
 import math
 import time
@@ -13,14 +13,18 @@ from .time_manager import TimeManager
 from .tt import Flag, TTEntry
 
 MATE = 1e6
-_MAX_DEPTH = 50          # practical ceiling; time limit stops us far earlier
-_ASPIRATION_DELTA = 50   # centipawns — initial aspiration window half-width
-_IID_MIN_DEPTH = 3       # minimum depth for internal iterative deepening
-_NMP_R = 2               # null-move depth reduction
-_LMR_MIN_DEPTH = 3       # minimum depth to apply late-move reduction
-_LMR_FULL_MOVES = 4      # moves searched at full depth before LMR kicks in
-_SE_MIN_DEPTH = 6        # minimum depth for singular extensions
-_SE_MARGIN = 50.0        # centipawns below TT score that makes a move singular
+_MAX_DEPTH = 50
+_ASPIRATION_DELTA = 50
+_IID_MIN_DEPTH = 3
+_NMP_R = 2
+_LMR_MIN_DEPTH = 3
+_LMR_MIN_MOVE_INDEX = 4
+_SE_MIN_DEPTH = 6
+_SE_MARGIN = 50.0
+# Futility: at depth 1 only, skip quiet non-special moves when eval is far below alpha.
+_FUTILITY_MARGIN = 150       # centipawns — one pawn and a bit of tempo
+_INSTABILITY_THRESHOLD = 30.0  # cp swing between depths that triggers a time extension
+_INSTABILITY_FACTOR = 1.5
 
 _PIECE_VAL: dict[int, int] = {
     chess.PAWN: 100,
@@ -37,6 +41,10 @@ _killers: list[list[chess.Move | None]] = cast(
     [[None, None] for _ in range(_MAX_DEPTH + 2)],
 )
 _NO_KILLERS: list[chess.Move | None] = [None, None]
+
+# History heuristic: _history[from_sq][to_sq] accumulates depth^2 on quiet beta cutoffs.
+# Reset each get_move call; capped below the killer score band (8000-9000).
+_history: list[list[int]] = [[0] * 64 for _ in range(64)]
 
 
 class _Timeout(Exception):
@@ -87,7 +95,7 @@ def _move_score(
         return 9_000
     if killers[1] is not None and move == killers[1]:
         return 8_000
-    return 0
+    return _history[move.from_square][move.to_square]
 
 
 def quiesce(board: chess.Board, alpha: float, beta: float, deadline: float) -> float:
@@ -96,7 +104,7 @@ def quiesce(board: chess.Board, alpha: float, beta: float, deadline: float) -> f
         raise _Timeout()
 
     bbs, stm = encode(board)
-    stand_pat = float(evaluate(bbs, stm, 0))
+    stand_pat = float(evaluate(bbs, stm))
 
     if board.is_check():
         moves = _get_legal_moves(board)
@@ -134,11 +142,15 @@ def alphabeta(
     if time.monotonic() >= deadline:
         raise _Timeout()
 
+    # Draw by repetition or 50-move rule.
+    if board.is_repetition(2) or board.halfmove_clock >= 100:
+        return 0.0
+
     key = cast(int, board._transposition_key())
     entry = _tt.probe(key)
     tt_move: chess.Move | None = entry.move if entry is not None else None
 
-    # TT cutoff — skip when we are inside a singular probe to get a fresh result.
+    # TT cutoff — skip when inside a singular probe to get a fresh result.
     if excluded_move is None and entry is not None and entry.depth >= depth:
         if entry.flag == Flag.EXACT:
             return entry.score
@@ -156,11 +168,13 @@ def alphabeta(
     if depth == 0:
         return quiesce(board, alpha, beta, deadline)
 
+    in_check = board.is_check()
+
     # Null-move pruning — disabled in check and in king+pawn endings (zugzwang risk).
     if (
         excluded_move is None
         and depth >= _NMP_R + 1
-        and not board.is_check()
+        and not in_check
         and _has_non_pawn_material(board)
     ):
         board.push(chess.Move.null())
@@ -169,21 +183,19 @@ def alphabeta(
         if null_score >= beta:
             return beta
 
-    # IID — shallow search to get a TT move for ordering when none is cached.
+    # IID — shallow search to get a TT move when none is cached.
     if excluded_move is None and tt_move is None and depth >= _IID_MIN_DEPTH:
         alphabeta(board, depth - 2, alpha, beta, deadline, ply)
         iid_entry = _tt.probe(key)
         if iid_entry is not None:
             tt_move = iid_entry.move
 
-    # Singular extension probe: if TT move exists with a reliable score, check
-    # whether it is the only good move.  A reduced search excluding the TT move
-    # that fails below (tt_score - margin) confirms singularity → extend by 1.
+    # Singular extension probe.
     singular_move: chess.Move | None = None
     if (
         excluded_move is None
         and depth >= _SE_MIN_DEPTH
-        and not board.is_check()
+        and not in_check
         and tt_move is not None
         and entry is not None
         and entry.depth >= depth - 3
@@ -198,10 +210,24 @@ def alphabeta(
         if s_score < s_beta:
             singular_move = tt_move
 
+    # Futility pruning at depth 1: if the static eval plus a one-pawn buffer can't
+    # reach alpha, quiet non-special moves are unlikely to help.
+    futile = False
+    if (
+        excluded_move is None
+        and depth == 1
+        and not in_check
+        and abs(alpha) < MATE / 2
+        and abs(beta) < MATE / 2
+    ):
+        bbs, stm = encode(board)
+        static_eval = float(evaluate(bbs, stm))
+        if static_eval + _FUTILITY_MARGIN <= alpha:
+            futile = True
+
     killers = _killers[ply] if ply < len(_killers) else _NO_KILLERS
     moves.sort(key=lambda m: _move_score(board, m, tt_move, killers), reverse=True)
 
-    in_check = board.is_check()
     orig_alpha = alpha
     best_score = -math.inf
     best_move_at_node: chess.Move | None = None
@@ -219,26 +245,34 @@ def alphabeta(
             killers[1] is not None and move == killers[1]
         )
 
+        # Skip quiet non-killer non-TT moves when futility is triggered.
+        if futile and is_quiet and not is_killer and move != tt_move:
+            continue
+
         board.push(move)
         gives_check = board.is_check()
 
-        # Extensions: singular move gets +1, giving check gets +1, cap at 1.
+        # Extensions: singular or check, capped at 1.
         ext = 1 if (singular_move is not None and move == tt_move) or gives_check else 0
 
-        # Late-move reduction: quiet non-special moves tried late, no extension.
-        use_lmr = (
+        # LMR: log-based reduction for quiet non-special moves searched late.
+        lmr_reduction = 0
+        if (
             ext == 0
             and depth >= _LMR_MIN_DEPTH
-            and i >= _LMR_FULL_MOVES
+            and i >= _LMR_MIN_MOVE_INDEX
             and is_quiet
             and not in_check
             and not gives_check
             and move != tt_move
             and not is_killer
-        )
+        ):
+            lmr_reduction = max(1, int(math.log(depth) * math.log(i + 1) / 2))
 
-        if use_lmr:
-            score = -alphabeta(board, depth - 2, -alpha - 1.0, -alpha, deadline, ply + 1)
+        if lmr_reduction > 0:
+            score = -alphabeta(
+                board, depth - 1 - lmr_reduction, -alpha - 1.0, -alpha, deadline, ply + 1
+            )
             if score > alpha:
                 score = -alphabeta(board, depth - 1, -beta, -alpha, deadline, ply + 1)
         else:
@@ -247,9 +281,12 @@ def alphabeta(
         board.pop()
 
         if score >= beta:
-            if is_quiet and (killers[0] is None or move != killers[0]):
-                killers[1] = killers[0]
-                killers[0] = move
+            if is_quiet:
+                if killers[0] is None or move != killers[0]:
+                    killers[1] = killers[0]
+                    killers[0] = move
+                h = _history[move.from_square][move.to_square] + depth * depth
+                _history[move.from_square][move.to_square] = h if h < 7_000 else 7_000
             if excluded_move is None:
                 _tt.store(key, TTEntry(depth, score, Flag.LOWER_BOUND, move))
             return beta
@@ -260,7 +297,8 @@ def alphabeta(
         if score > alpha:
             alpha = score
 
-    if excluded_move is None:
+    # Guard: don't store -inf (all moves were futility-pruned with no captures).
+    if excluded_move is None and best_score > -math.inf:
         flag = Flag.UPPER_BOUND if best_score <= orig_alpha else Flag.EXACT
         _tt.store(key, TTEntry(depth, best_score, flag, best_move_at_node))
     return alpha
@@ -285,7 +323,7 @@ def _root_search(
             best_score = score
             candidate = move
         if score >= beta:
-            break  # fail high
+            break
     return best_score, candidate
 
 
@@ -295,12 +333,15 @@ def get_move(fen: str, time_left_ms: int) -> str:
 
     for k in _killers:
         k[0] = k[1] = None
+    for row in _history:
+        row[:] = [0] * 64
 
     moves = _get_legal_moves(board)
     assert moves
     best_move = moves[0]
     prev_score: float = 0.0
     root_key = cast(int, board._transposition_key())
+    time_extended = False
 
     for depth in range(1, _MAX_DEPTH + 1):
         if depth > 2:
@@ -329,11 +370,19 @@ def get_move(fen: str, time_left_ms: int) -> str:
                 timed_out = True
                 break
             if lo < score < hi:
-                break  # exact score — no need to try the fallback window
+                break
 
         if timed_out:
             break
         if candidate is not None:
+            # Extend soft deadline when the score swings sharply between depths.
+            if (
+                not time_extended
+                and depth > 1
+                and abs(score - prev_score) >= _INSTABILITY_THRESHOLD
+            ):
+                tm.extend(_INSTABILITY_FACTOR)
+                time_extended = True
             best_move = candidate
             prev_score = score
             _tt.store(root_key, TTEntry(depth, score, Flag.EXACT, best_move))
