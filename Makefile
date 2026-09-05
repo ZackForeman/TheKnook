@@ -9,7 +9,7 @@ play:
 	uv run python -m harness.play --white . --black baselines/greedy $(if $(FEN),--fen "$(FEN)")
 
 arena:
-	uv run python -m harness.arena --opponent baselines/numba --games 20
+	uv run python -m harness.arena --opponent baselines/v1 --games 20
 
 zip:
 	uv run python -m harness.package --include src
@@ -17,4 +17,4 @@ zip:
 gate:
 	uv run ruff check .
 	uv run mypy
-	uv run python -m harness.arena --opponent baselines/numba --games 2 --base-ms 5000
+	uv run python -m harness.arena --opponent baselines/v1 --games 2 --base-ms 5000
