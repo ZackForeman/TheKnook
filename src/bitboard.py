@@ -4,6 +4,8 @@ import chess
 import numpy as np
 from numba import njit
 
+from .movegen import bishop_attacks_bb, knight_attacks_bb, queen_attacks_bb, rook_attacks_bb
+
 MATERIAL = np.array([100, 320, 330, 500, 900, 0], dtype=np.int32)
 # index = piece_type - 1: 0=pawn 1=knight 2=bishop 3=rook 4=queen 5=king
 
@@ -145,6 +147,7 @@ ROOK_OPEN_FILE_BONUS: np.int32 = np.int32(25)
 ROOK_SEMI_OPEN_BONUS: np.int32 = np.int32(12)
 KING_PAWN_SHIELD_BONUS: np.int32 = np.int32(10)
 KING_OPEN_FILE_PENALTY: np.int32 = np.int32(20)
+MOBILITY_WEIGHT: np.int32 = np.int32(4)
 
 FILE_MASKS: np.ndarray = np.zeros(8, dtype=np.uint64)
 for _f in range(8):
@@ -411,6 +414,43 @@ def evaluate(bbs: np.ndarray, stm: int) -> int:
             + popcount(bbs[opp][4] & zone) * 5
         )
         score -= danger * 8 * phase // 24
+
+    # ---- Mobility: reachable squares for non-pawn, non-king pieces ----
+    occupied_all = np.uint64(0)
+    for _c in range(2):
+        for _p in range(6):
+            occupied_all |= bbs[_c][_p]
+
+    mob_stm = 0
+    mob_opp = 0
+    for _pt in range(1, 5):  # knight=1, bishop=2, rook=3, queen=4
+        bb_s = bbs[stm][_pt]
+        while bb_s:
+            lsb = bb_s & (~bb_s + np.uint64(1))
+            sq = popcount(lsb - np.uint64(1))
+            if _pt == 1:
+                mob_stm += popcount(knight_attacks_bb(sq))
+            elif _pt == 2:
+                mob_stm += popcount(bishop_attacks_bb(sq, occupied_all))
+            elif _pt == 3:
+                mob_stm += popcount(rook_attacks_bb(sq, occupied_all))
+            else:
+                mob_stm += popcount(queen_attacks_bb(sq, occupied_all))
+            bb_s ^= lsb
+        bb_o = bbs[opp][_pt]
+        while bb_o:
+            lsb = bb_o & (~bb_o + np.uint64(1))
+            sq = popcount(lsb - np.uint64(1))
+            if _pt == 1:
+                mob_opp += popcount(knight_attacks_bb(sq))
+            elif _pt == 2:
+                mob_opp += popcount(bishop_attacks_bb(sq, occupied_all))
+            elif _pt == 3:
+                mob_opp += popcount(rook_attacks_bb(sq, occupied_all))
+            else:
+                mob_opp += popcount(queen_attacks_bb(sq, occupied_all))
+            bb_o ^= lsb
+    score += int(MOBILITY_WEIGHT) * (mob_stm - mob_opp)
 
     return score
 

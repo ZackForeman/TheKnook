@@ -20,8 +20,8 @@ class TimeManager:
         base_ms = effective_budget / moves_to_go
         # soft: stop ID after completing a depth if past this
         # hard: capped at 1.5x base and 15% of actual clock
-        soft_ms = base_ms * 0.7
-        hard_ms = min(base_ms * 1.5, safe_ms * 0.15)
+        soft_ms = base_ms * 0.75
+        hard_ms = min(base_ms * 2.0, safe_ms * 0.15)
         self.soft_deadline: float = now + soft_ms / 1000.0
         self.hard_deadline: float = now + hard_ms / 1000.0
 
