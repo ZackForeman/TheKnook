@@ -2,10 +2,9 @@
 
 import math
 import time
-from typing import NamedTuple, cast
+from typing import cast
 
 import chess
-import chess.polyglot
 import numpy as np
 
 from . import tt as _tt
@@ -34,7 +33,8 @@ _SE_MIN_DEPTH = 6
 _SE_MARGIN = 50.0
 # Futility: at depth 1 only, skip quiet non-special moves when eval is far below alpha.
 _FUTILITY_MARGIN = 150       # centipawns — one pawn and a bit of tempo
-_DELTA_MARGIN = 200          # quiescence delta pruning buffer
+_DELTA_MARGIN = 200          # quiescence delta pruning buffer (promotion bonus)
+_MAX_GAIN = 900 + _DELTA_MARGIN  # = 1100; queen value + buffer
 _INSTABILITY_THRESHOLD = 30.0  # cp swing between depths that triggers a time extension
 _INSTABILITY_FACTOR = 1.5
 
@@ -65,22 +65,6 @@ _PIECE_VAL: dict[int, int] = {
     chess.QUEEN: 900,
     chess.KING: 20_000,
 }
-
-# Position-level quiescence delta: the max plausible material swing in one move — capturing
-# a queen while promoting our own pawn to a queen — plus a safety buffer.
-_MAX_GAIN = (
-    _PIECE_VAL[chess.QUEEN]
-    + (_PIECE_VAL[chess.QUEEN] - _PIECE_VAL[chess.PAWN])
-    + _DELTA_MARGIN
-)
-
-
-class _SearchResult(NamedTuple):
-    """A search score plus whether it's path-dependent (see alphabeta's draw handling)."""
-
-    score: float
-    tainted: bool
-
 
 # Two killer moves per ply; cleared each get_move call.
 _killers: list[list[chess.Move | None]] = cast(
@@ -118,13 +102,13 @@ def _get_legal_moves(board: chess.Board) -> list[chess.Move]:
 
 
 def _get_captures(board: chess.Board) -> list[chess.Move]:
-    """Legal captures and promotions (any piece) — moves searched in quiescence."""
+    """Legal captures and queen promotions — moves searched in quiescence."""
     bbs, stm = encode(board)
     ep_sq = board.ep_square if board.ep_square is not None else -1
     candidates = generate_pseudo_legal(bbs, stm, ep_sq, board.castling_rights)
     return [
         m for m in candidates
-        if board.is_legal(m) and (board.is_capture(m) or m.promotion is not None)
+        if board.is_legal(m) and (board.is_capture(m) or m.promotion == chess.QUEEN)
     ]
 
 
@@ -189,12 +173,9 @@ def _see(board: chess.Board, move: chess.Move) -> int:
     to_sq = move.to_square
     target_pt = board.piece_type_at(to_sq)
     if target_pt is None:
-        if board.is_en_passant(move):
-            target_val = _PIECE_VAL[chess.PAWN]
-        elif move.promotion is not None:
-            target_val = 0  # quiet promotion — no piece captured, just the promotion delta below
-        else:
+        if not board.is_en_passant(move):
             return 0
+        target_val = _PIECE_VAL[chess.PAWN]
     else:
         target_val = _PIECE_VAL[target_pt]
 
@@ -251,25 +232,17 @@ def quiesce(board: chess.Board, alpha: float, beta: float, deadline: float, ply:
         # Position-level delta: if even winning a queen + buffer can't reach alpha, give up.
         if stand_pat + _MAX_GAIN < alpha:
             return alpha
-        # SEE filter and sort: skip losing captures (except promotions — rare and tactically
-        # important enough to always search), order winning ones first.
+        # SEE filter and sort: skip losing captures, order winning ones first.
         all_captures = _get_captures(board)
         see_scores = {id(m): _see(board, m) for m in all_captures}
-        moves = [m for m in all_captures if see_scores[id(m)] >= 0 or m.promotion is not None]
+        moves = [m for m in all_captures if see_scores[id(m)] >= 0]
         moves.sort(key=lambda m: see_scores[id(m)], reverse=True)
 
     for move in moves:
         # Per-capture delta: skip if gaining this piece for free can't reach alpha.
         if not in_check_now:
             victim = board.piece_type_at(move.to_square)
-            if victim is not None:
-                victim_val = _PIECE_VAL[victim]
-            elif board.is_en_passant(move):
-                victim_val = _PIECE_VAL[chess.PAWN]
-            else:
-                victim_val = 0
-            if move.promotion is not None:
-                victim_val += _PIECE_VAL[move.promotion] - _PIECE_VAL[chess.PAWN]
+            victim_val = _PIECE_VAL[victim] if victim is not None else _PIECE_VAL[chess.PAWN]
             if stand_pat + victim_val + _DELTA_MARGIN < alpha:
                 continue
         board.push(move)
@@ -292,22 +265,15 @@ def alphabeta(
     ply: int = 0,
     excluded_move: chess.Move | None = None,
     prev_move: chess.Move | None = None,
-) -> _SearchResult:
+) -> float:
     if time.monotonic() >= deadline:
         raise _Timeout()
 
-    # Draw by repetition or 50-move rule — but checkmate/stalemate always takes priority.
-    # is_repetition(3) is only ever checking repeats created within this search tree: since
-    # get_move() is handed a bare FEN each call, board has no real prior-game move history,
-    # so this is a heuristic proxy for a real threefold, not a guarantee of one. A score
-    # returned here is path-dependent ("tainted") and must never be cached (see below).
-    if board.is_repetition(3) or board.halfmove_clock >= 100:
-        if not _get_legal_moves(board):
-            terminal = float(-(MATE - ply)) if board.is_check() else 0.0
-            return _SearchResult(terminal, False)
-        return _SearchResult(0.0, True)
+    # Draw by repetition or 50-move rule.
+    if board.is_repetition(2) or board.halfmove_clock >= 100:
+        return 0.0
 
-    key = chess.polyglot.zobrist_hash(board)
+    key = cast(int, board._transposition_key())
     entry = _tt.probe(key)
     tt_move: chess.Move | None = entry.move if entry is not None else None
 
@@ -315,24 +281,22 @@ def alphabeta(
     if excluded_move is None and entry is not None and entry.depth >= depth:
         tt_score = _tt_denorm(entry.score, ply)
         if entry.flag == Flag.EXACT:
-            return _SearchResult(tt_score, False)
+            return tt_score
         if entry.flag == Flag.LOWER_BOUND:
             alpha = max(alpha, tt_score)
         elif entry.flag == Flag.UPPER_BOUND:
             beta = min(beta, tt_score)
         if alpha >= beta:
-            return _SearchResult(tt_score, False)
+            return tt_score
 
     moves = _get_legal_moves(board)
     if not moves:
-        terminal = float(-(MATE - ply)) if board.is_check() else 0.0
-        return _SearchResult(terminal, False)
+        return float(-(MATE - ply)) if board.is_check() else 0.0
 
     if depth == 0:
-        return _SearchResult(quiesce(board, alpha, beta, deadline, ply), False)
+        return quiesce(board, alpha, beta, deadline, ply)
 
     in_check = board.is_check()
-    node_tainted = False
 
     # Null-move pruning — disabled in check and in king+pawn endings (zugzwang risk).
     if (
@@ -342,10 +306,10 @@ def alphabeta(
         and _has_non_pawn_material(board)
     ):
         board.push(chess.Move.null())
-        null_result = alphabeta(board, depth - 1 - _NMP_R, -beta, -beta + 1.0, deadline, ply + 1)
+        null_score = -alphabeta(board, depth - 1 - _NMP_R, -beta, -beta + 1.0, deadline, ply + 1)
         board.pop()
-        if -null_result.score >= beta:
-            return _SearchResult(beta, False)
+        if null_score >= beta:
+            return beta
 
     # IID — shallow search to get a TT move when none is cached.
     if excluded_move is None and tt_move is None and depth >= _IID_MIN_DEPTH:
@@ -367,11 +331,11 @@ def alphabeta(
         and abs(entry.score) < _MATE_THRESHOLD
     ):
         s_beta = _tt_denorm(entry.score, ply) - _SE_MARGIN
-        s_result = alphabeta(
+        s_score = alphabeta(
             board, max(1, depth // 2), s_beta - 1.0, s_beta,
             deadline, ply, excluded_move=tt_move,
         )
-        if s_result.score < s_beta:
+        if s_score < s_beta:
             singular_move = tt_move
 
     # Futility pruning at depth 1: if the static eval plus a one-pawn buffer can't
@@ -409,16 +373,8 @@ def alphabeta(
             killers[1] is not None and move == killers[1]
         )
 
-        # Skip quiet non-killer non-TT moves when futility is triggered — unless the move
-        # gives check, since a quiet check can be a mate or a strong tactic and must never
-        # be pruned purely for being "quiet".
-        if (
-            futile
-            and is_quiet
-            and not is_killer
-            and move != tt_move
-            and not board.gives_check(move)
-        ):
+        # Skip quiet non-killer non-TT moves when futility is triggered.
+        if futile and is_quiet and not is_killer and move != tt_move:
             continue
 
         board.push(move)
@@ -442,27 +398,20 @@ def alphabeta(
             lmr_reduction = max(1, int(math.log(depth) * math.log(i + 1) / 2))
 
         if lmr_reduction > 0:
-            result = alphabeta(
+            score = -alphabeta(
                 board, depth - 1 - lmr_reduction, -alpha - 1.0, -alpha, deadline, ply + 1,
                 prev_move=move,
             )
-            score = -result.score
-            tainted = result.tainted
             if score > alpha:
-                result = alphabeta(
+                score = -alphabeta(
                     board, depth - 1, -beta, -alpha, deadline, ply + 1, prev_move=move,
                 )
-                score = -result.score
-                tainted = tainted or result.tainted
         else:
-            result = alphabeta(
+            score = -alphabeta(
                 board, depth - 1 + ext, -beta, -alpha, deadline, ply + 1, prev_move=move,
             )
-            score = -result.score
-            tainted = result.tainted
 
         board.pop()
-        node_tainted = node_tainted or tainted
 
         if score >= beta:
             if is_quiet:
@@ -473,9 +422,9 @@ def alphabeta(
                 _history[move.from_square][move.to_square] = h if h < 7_000 else 7_000
                 if prev_move is not None:
                     _counter[prev_move.from_square][prev_move.to_square] = move
-            if excluded_move is None and not node_tainted:
+            if excluded_move is None:
                 _tt.store(key, TTEntry(depth, _tt_norm(score, ply), Flag.LOWER_BOUND, move))
-            return _SearchResult(beta, node_tainted)
+            return beta
 
         if score > best_score:
             best_score = score
@@ -484,10 +433,10 @@ def alphabeta(
             alpha = score
 
     # Guard: don't store -inf (all moves were futility-pruned with no captures).
-    if excluded_move is None and best_score > -math.inf and not node_tainted:
+    if excluded_move is None and best_score > -math.inf:
         flag = Flag.UPPER_BOUND if best_score <= orig_alpha else Flag.EXACT
         _tt.store(key, TTEntry(depth, _tt_norm(best_score, ply), flag, best_move_at_node))
-    return _SearchResult(alpha, node_tainted)
+    return alpha
 
 
 def _root_search(
@@ -503,8 +452,7 @@ def _root_search(
     candidate: chess.Move | None = None
     for move in moves:
         board.push(move)
-        result = alphabeta(board, depth - 1, -beta, -best_score, deadline, ply=1, prev_move=move)
-        score = -result.score
+        score = -alphabeta(board, depth - 1, -beta, -best_score, deadline, ply=1, prev_move=move)
         board.pop()
         if score > best_score:
             best_score = score
@@ -529,7 +477,7 @@ def get_move(fen: str, time_left_ms: int) -> str:
     assert moves
     best_move = moves[0]
     prev_score: float = 0.0
-    root_key = chess.polyglot.zobrist_hash(board)
+    root_key = cast(int, board._transposition_key())
     time_extended = False
 
     for depth in range(1, _MAX_DEPTH + 1):

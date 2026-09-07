@@ -25,7 +25,8 @@ and they change, so fetch them before you rely on a number.
 - Import time has a 90 second budget before the clock starts. Load weights there.
 - 120 s + 0.5 s per move, per side, on wall time. One core, 2 GB, no network, no GPU.
 - Illegal move, malformed output, crash, out of memory, or flag fall loses that game. A move
-  reply over 4 KB counts as illegal. 300 plies without a result goes to material adjudication.
+  reply over 4 KB counts as illegal. A game still running at 600 plies is drawn, and the
+  opening position counts toward those 600 — there is no material adjudication.
 - Everything in the zip together stays under 50 MB unzipped.
 - Ten uploads per team per day, and the latest one that passed validation is the one that plays.
 - Rated games start from curated opening positions, not the standard start. The set is not

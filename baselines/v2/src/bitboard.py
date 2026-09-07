@@ -235,34 +235,35 @@ def evaluate(bbs: np.ndarray, stm: int) -> int:
     phase = _game_phase(bbs)
     score = 0
 
-    # Pawns through queens: material + static PST.
-    # PST orientation is a function of absolute piece color (White never mirrors, Black
-    # always does), not of side-to-move — bbs[0]/bbs[1] from encode() are always absolute
-    # White/Black, regardless of whose turn it is.
+    # Pawns through queens: material + static PST
     for pt in range(5):
         score += MATERIAL[pt] * (popcount(bbs[stm][pt]) - popcount(bbs[opp][pt]))
-        for c in range(2):
-            sign = 1 if c == stm else -1
-            bb = bbs[c][pt]
-            while bb:
-                lsb = bb & (~bb + np.uint64(1))
-                sq = popcount(lsb - np.uint64(1))
-                sq_eval = sq if c == 0 else sq ^ 56
-                score += sign * int(PST[pt, sq_eval])
-                bb ^= lsb
-
-    # King: tapered between MG and EG tables (same absolute-color orientation as above).
-    for c in range(2):
-        sign = 1 if c == stm else -1
-        bb = bbs[c][5]
+        bb = bbs[stm][pt]
         while bb:
             lsb = bb & (~bb + np.uint64(1))
             sq = popcount(lsb - np.uint64(1))
-            sq_eval = sq if c == 0 else sq ^ 56
-            score += sign * (
-                (phase * int(PST[5, sq_eval]) + (24 - phase) * int(PST_EG_KING[sq_eval])) // 24
-            )
+            score += int(PST[pt, sq])
             bb ^= lsb
+        bb = bbs[opp][pt]
+        while bb:
+            lsb = bb & (~bb + np.uint64(1))
+            sq = popcount(lsb - np.uint64(1))
+            score -= int(PST[pt, sq ^ 56])
+            bb ^= lsb
+
+    # King: tapered between MG and EG tables
+    bb = bbs[stm][5]
+    while bb:
+        lsb = bb & (~bb + np.uint64(1))
+        sq = popcount(lsb - np.uint64(1))
+        score += (phase * int(PST[5, sq]) + (24 - phase) * int(PST_EG_KING[sq])) // 24
+        bb ^= lsb
+    bb = bbs[opp][5]
+    while bb:
+        lsb = bb & (~bb + np.uint64(1))
+        sq = popcount(lsb - np.uint64(1))
+        score -= (phase * int(PST[5, sq ^ 56]) + (24 - phase) * int(PST_EG_KING[sq ^ 56])) // 24
+        bb ^= lsb
 
     # Passed pawns
     their_pawns = bbs[opp][0]
@@ -415,14 +416,10 @@ def evaluate(bbs: np.ndarray, stm: int) -> int:
         score -= danger * 8 * phase // 24
 
     # ---- Mobility: reachable squares for non-pawn, non-king pieces ----
-    # Attacks are masked with ~own_occ so squares blocked by the piece's own side don't
-    # count as "mobility" (a square occupied by the enemy still counts — it's a capture).
-    stm_occ = np.uint64(0)
-    opp_occ = np.uint64(0)
-    for _p in range(6):
-        stm_occ |= bbs[stm][_p]
-        opp_occ |= bbs[opp][_p]
-    occupied_all = stm_occ | opp_occ
+    occupied_all = np.uint64(0)
+    for _c in range(2):
+        for _p in range(6):
+            occupied_all |= bbs[_c][_p]
 
     mob_stm = 0
     mob_opp = 0
@@ -432,28 +429,26 @@ def evaluate(bbs: np.ndarray, stm: int) -> int:
             lsb = bb_s & (~bb_s + np.uint64(1))
             sq = popcount(lsb - np.uint64(1))
             if _pt == 1:
-                atk_s = knight_attacks_bb(sq)
+                mob_stm += popcount(knight_attacks_bb(sq))
             elif _pt == 2:
-                atk_s = bishop_attacks_bb(sq, occupied_all)
+                mob_stm += popcount(bishop_attacks_bb(sq, occupied_all))
             elif _pt == 3:
-                atk_s = rook_attacks_bb(sq, occupied_all)
+                mob_stm += popcount(rook_attacks_bb(sq, occupied_all))
             else:
-                atk_s = queen_attacks_bb(sq, occupied_all)
-            mob_stm += popcount(atk_s & ~stm_occ)
+                mob_stm += popcount(queen_attacks_bb(sq, occupied_all))
             bb_s ^= lsb
         bb_o = bbs[opp][_pt]
         while bb_o:
             lsb = bb_o & (~bb_o + np.uint64(1))
             sq = popcount(lsb - np.uint64(1))
             if _pt == 1:
-                atk_o = knight_attacks_bb(sq)
+                mob_opp += popcount(knight_attacks_bb(sq))
             elif _pt == 2:
-                atk_o = bishop_attacks_bb(sq, occupied_all)
+                mob_opp += popcount(bishop_attacks_bb(sq, occupied_all))
             elif _pt == 3:
-                atk_o = rook_attacks_bb(sq, occupied_all)
+                mob_opp += popcount(rook_attacks_bb(sq, occupied_all))
             else:
-                atk_o = queen_attacks_bb(sq, occupied_all)
-            mob_opp += popcount(atk_o & ~opp_occ)
+                mob_opp += popcount(queen_attacks_bb(sq, occupied_all))
             bb_o ^= lsb
     score += int(MOBILITY_WEIGHT) * (mob_stm - mob_opp)
 

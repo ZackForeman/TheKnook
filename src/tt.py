@@ -1,8 +1,9 @@
-"""Transposition table."""
+"""Transposition table: fixed-size, zobrist-keyed, depth-preferred replacement."""
 
 from enum import IntEnum
 
 import chess
+import numpy as np
 
 
 class Flag(IntEnum):
@@ -21,18 +22,42 @@ class TTEntry:
         self.move = move
 
 
-_table: dict[int, TTEntry] = {}
+# Bounded, array-backed table (no unbounded growth over a long game). ~4.2M slots at
+# _TABLE_BITS=22 costs well under the platform's 2 GB/process budget.
+_TABLE_BITS = 22
+_TABLE_SIZE = 1 << _TABLE_BITS
+_MASK = _TABLE_SIZE - 1
+_EMPTY_KEY = np.uint64(2**64 - 1)  # sentinel; a real zobrist hash matching this is negligible
+
+_keys: np.ndarray = np.full(_TABLE_SIZE, _EMPTY_KEY, dtype=np.uint64)
+_depths: np.ndarray = np.zeros(_TABLE_SIZE, dtype=np.int16)
+_scores: np.ndarray = np.zeros(_TABLE_SIZE, dtype=np.float32)
+_flags: np.ndarray = np.zeros(_TABLE_SIZE, dtype=np.int8)
+_moves: list[chess.Move | None] = [None] * _TABLE_SIZE
 
 
 def probe(key: int) -> TTEntry | None:
-    return _table.get(key)
+    idx = key & _MASK
+    if _keys[idx] != np.uint64(key):
+        return None
+    return TTEntry(int(_depths[idx]), float(_scores[idx]), Flag(int(_flags[idx])), _moves[idx])
 
 
 def store(key: int, entry: TTEntry) -> None:
-    existing = _table.get(key)
-    if existing is None or entry.depth >= existing.depth:
-        _table[key] = entry
+    idx = key & _MASK
+    k = np.uint64(key)
+    same_key = _keys[idx] == k
+    if not same_key or entry.depth >= int(_depths[idx]):
+        _keys[idx] = k
+        _depths[idx] = entry.depth
+        _scores[idx] = entry.score
+        _flags[idx] = int(entry.flag)
+        _moves[idx] = entry.move
 
 
 def clear() -> None:
-    _table.clear()
+    _keys.fill(_EMPTY_KEY)
+    _depths.fill(0)
+    _scores.fill(0.0)
+    _flags.fill(0)
+    _moves[:] = [None] * _TABLE_SIZE
