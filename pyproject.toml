@@ -22,7 +22,7 @@ url = "https://download.pytorch.org/whl/cpu"
 explicit = true
 
 [dependency-groups]
-dev = ["mypy>=1.18", "ruff>=0.14"]
+dev = ["mypy>=1.18", "pytest>=8", "ruff>=0.14"]
 
 [tool.ruff]
 line-length = 100
@@ -34,4 +34,7 @@ ignore = ["N818"]
 
 [tool.mypy]
 strict = true
-files = ["agent.py", "harness"]
+files = ["agent.py", "harness", "src", "tests"]
+
+[tool.pytest.ini_options]
+pythonpath = ["."]
