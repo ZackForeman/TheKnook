@@ -19,6 +19,7 @@ from .movegen import (
     queen_attacks_bb,
     rook_attacks_bb,
 )
+from .nnue import NNUE_AVAILABLE, AccumulatorStack, nnue_evaluate
 from .time_manager import TimeManager
 from .tt import Flag, TTEntry
 
@@ -89,12 +90,7 @@ _killers: list[list[chess.Move | None]] = cast(
 )
 _NO_KILLERS: list[chess.Move | None] = [None, None]
 
-# History heuristic: _history[from_sq][to_sq] accumulates depth^2 on quiet beta cutoffs.
-# Reset each get_move call; capped below the killer score band (8000-9000).
 _history: list[list[int]] = [[0] * 64 for _ in range(64)]
-
-# Countermove heuristic: best response to the previous move.
-# Scored between killers (8000-9000) and history.
 _counter: list[list[chess.Move | None]] = [[None] * 64 for _ in range(64)]
 
 
@@ -160,9 +156,7 @@ def _lva_sq(to_sq: int, occ: int, is_white: bool, board: chess.Board) -> int:
     occ_u = np.uint64(occ)
     color_co = chess.WHITE if is_white else chess.BLACK
     color_bb = int(board.occupied_co[color_co]) & occ
-    # White pawns that attack to_sq sit on squares attacked by a black pawn FROM to_sq (idx=1).
-    # Black pawns that attack to_sq sit on squares attacked by a white pawn FROM to_sq (idx=0).
-    pawn_atk_idx = 1 if is_white else 0  # int, not bool — Numba requires int array index
+    pawn_atk_idx = 1 if is_white else 0
     bb = int(pawn_attacks_bb(pawn_atk_idx, to_sq)) & color_bb & int(board.pawns)
     if bb:
         return (bb & -bb).bit_length() - 1
@@ -210,7 +204,7 @@ def _see(board: chess.Board, move: chess.Move) -> int:
 
     gain: list[int] = [target_val]
     current_pt = moving_pt
-    is_white = not board.turn  # opponent recaptures first
+    is_white = not board.turn
 
     while True:
         sq = _lva_sq(to_sq, occ, is_white, board)
@@ -222,20 +216,33 @@ def _see(board: chess.Board, move: chess.Move) -> int:
         occ ^= 1 << sq
         is_white = not is_white
 
-    # Backward negamax: each player can choose not to recapture.
     for i in range(len(gain) - 2, 0, -1):
         gain[i - 1] = -max(-gain[i - 1], gain[i])
 
     return gain[0]
 
 
-def quiesce(board: chess.Board, alpha: float, beta: float, deadline: float, ply: int = 0) -> float:
+def _static_eval(board: chess.Board, acc_stack: AccumulatorStack) -> float:
+    """Position evaluation in centipawns from side-to-move perspective."""
+    if NNUE_AVAILABLE:
+        return float(nnue_evaluate(board, acc_stack))
+    bbs, stm = encode(board)
+    return float(evaluate(bbs, stm))
+
+
+def quiesce(
+    board: chess.Board,
+    alpha: float,
+    beta: float,
+    deadline: float,
+    ply: int,
+    acc_stack: AccumulatorStack,
+) -> float:
     """Capture search until quiet. Fixes the horizon effect."""
     if time.monotonic() >= deadline:
         raise _Timeout()
 
-    bbs, stm = encode(board)
-    stand_pat = float(evaluate(bbs, stm))
+    stand_pat = _static_eval(board, acc_stack)
 
     in_check_now = board.is_check()
     if in_check_now:
@@ -248,7 +255,6 @@ def quiesce(board: chess.Board, alpha: float, beta: float, deadline: float, ply:
             return beta
         if stand_pat > alpha:
             alpha = stand_pat
-        # Position-level delta: if even winning a queen + buffer can't reach alpha, give up.
         if stand_pat + _MAX_GAIN < alpha:
             return alpha
         # SEE filter and sort: skip losing captures (except promotions — rare and tactically
@@ -259,7 +265,6 @@ def quiesce(board: chess.Board, alpha: float, beta: float, deadline: float, ply:
         moves.sort(key=lambda m: see_scores[id(m)], reverse=True)
 
     for move in moves:
-        # Per-capture delta: skip if gaining this piece for free can't reach alpha.
         if not in_check_now:
             victim = board.piece_type_at(move.to_square)
             if victim is not None:
@@ -272,9 +277,11 @@ def quiesce(board: chess.Board, alpha: float, beta: float, deadline: float, ply:
                 victim_val += _PIECE_VAL[move.promotion] - _PIECE_VAL[chess.PAWN]
             if stand_pat + victim_val + _DELTA_MARGIN < alpha:
                 continue
+        acc_stack.push(move, board)
         board.push(move)
-        score = -quiesce(board, -beta, -alpha, deadline, ply + 1)
+        score = -quiesce(board, -beta, -alpha, deadline, ply + 1, acc_stack)
         board.pop()
+        acc_stack.pop()
         if score >= beta:
             return beta
         if score > alpha:
@@ -289,6 +296,7 @@ def alphabeta(
     alpha: float,
     beta: float,
     deadline: float,
+    acc_stack: AccumulatorStack,
     ply: int = 0,
     excluded_move: chess.Move | None = None,
     prev_move: chess.Move | None = None,
@@ -311,7 +319,6 @@ def alphabeta(
     entry = _tt.probe(key)
     tt_move: chess.Move | None = entry.move if entry is not None else None
 
-    # TT cutoff — skip when inside a singular probe to get a fresh result.
     if excluded_move is None and entry is not None and entry.depth >= depth:
         tt_score = _tt_denorm(entry.score, ply)
         if entry.flag == Flag.EXACT:
@@ -329,32 +336,33 @@ def alphabeta(
         return _SearchResult(terminal, False)
 
     if depth == 0:
-        return _SearchResult(quiesce(board, alpha, beta, deadline, ply), False)
+        return _SearchResult(quiesce(board, alpha, beta, deadline, ply, acc_stack), False)
 
     in_check = board.is_check()
     node_tainted = False
 
-    # Null-move pruning — disabled in check and in king+pawn endings (zugzwang risk).
     if (
         excluded_move is None
         and depth >= _NMP_R + 1
         and not in_check
         and _has_non_pawn_material(board)
     ):
+        acc_stack.push(chess.Move.null(), board)
         board.push(chess.Move.null())
-        null_result = alphabeta(board, depth - 1 - _NMP_R, -beta, -beta + 1.0, deadline, ply + 1)
+        null_result = alphabeta(
+            board, depth - 1 - _NMP_R, -beta, -beta + 1.0, deadline, acc_stack, ply + 1,
+        )
         board.pop()
+        acc_stack.pop()
         if -null_result.score >= beta:
             return _SearchResult(beta, False)
 
-    # IID — shallow search to get a TT move when none is cached.
     if excluded_move is None and tt_move is None and depth >= _IID_MIN_DEPTH:
-        alphabeta(board, depth - 2, alpha, beta, deadline, ply)
+        alphabeta(board, depth - 2, alpha, beta, deadline, acc_stack, ply)
         iid_entry = _tt.probe(key)
         if iid_entry is not None:
             tt_move = iid_entry.move
 
-    # Singular extension probe.
     singular_move: chess.Move | None = None
     if (
         excluded_move is None
@@ -369,13 +377,11 @@ def alphabeta(
         s_beta = _tt_denorm(entry.score, ply) - _SE_MARGIN
         s_result = alphabeta(
             board, max(1, depth // 2), s_beta - 1.0, s_beta,
-            deadline, ply, excluded_move=tt_move,
+            deadline, acc_stack, ply, excluded_move=tt_move,
         )
         if s_result.score < s_beta:
             singular_move = tt_move
 
-    # Futility pruning at depth 1: if the static eval plus a one-pawn buffer can't
-    # reach alpha, quiet non-special moves are unlikely to help.
     futile = False
     if (
         excluded_move is None
@@ -384,8 +390,7 @@ def alphabeta(
         and abs(alpha) < _MATE_THRESHOLD
         and abs(beta) < _MATE_THRESHOLD
     ):
-        bbs, stm = encode(board)
-        static_eval = float(evaluate(bbs, stm))
+        static_eval = _static_eval(board, acc_stack)
         if static_eval + _FUTILITY_MARGIN <= alpha:
             futile = True
 
@@ -421,13 +426,12 @@ def alphabeta(
         ):
             continue
 
+        acc_stack.push(move, board)
         board.push(move)
         gives_check = board.is_check()
 
-        # Extensions: singular or check, capped at 1.
         ext = 1 if (singular_move is not None and move == tt_move) or gives_check else 0
 
-        # LMR: log-based reduction for quiet non-special moves searched late.
         lmr_reduction = 0
         if (
             ext == 0
@@ -443,25 +447,28 @@ def alphabeta(
 
         if lmr_reduction > 0:
             result = alphabeta(
-                board, depth - 1 - lmr_reduction, -alpha - 1.0, -alpha, deadline, ply + 1,
-                prev_move=move,
+                board, depth - 1 - lmr_reduction, -alpha - 1.0, -alpha,
+                deadline, acc_stack, ply + 1, prev_move=move,
             )
             score = -result.score
             tainted = result.tainted
             if score > alpha:
                 result = alphabeta(
-                    board, depth - 1, -beta, -alpha, deadline, ply + 1, prev_move=move,
+                    board, depth - 1, -beta, -alpha, deadline, acc_stack, ply + 1,
+                    prev_move=move,
                 )
                 score = -result.score
                 tainted = tainted or result.tainted
         else:
             result = alphabeta(
-                board, depth - 1 + ext, -beta, -alpha, deadline, ply + 1, prev_move=move,
+                board, depth - 1 + ext, -beta, -alpha, deadline, acc_stack, ply + 1,
+                prev_move=move,
             )
             score = -result.score
             tainted = result.tainted
 
         board.pop()
+        acc_stack.pop()
         node_tainted = node_tainted or tainted
 
         if score >= beta:
@@ -497,15 +504,20 @@ def _root_search(
     alpha: float,
     beta: float,
     deadline: float,
+    acc_stack: AccumulatorStack,
 ) -> tuple[float, chess.Move | None]:
     """One pass over root moves within [alpha, beta]. Raises _Timeout."""
     best_score = alpha
     candidate: chess.Move | None = None
     for move in moves:
+        acc_stack.push(move, board)
         board.push(move)
-        result = alphabeta(board, depth - 1, -beta, -best_score, deadline, ply=1, prev_move=move)
+        result = alphabeta(
+            board, depth - 1, -beta, -best_score, deadline, acc_stack, ply=1, prev_move=move,
+        )
         score = -result.score
         board.pop()
+        acc_stack.pop()
         if score > best_score:
             best_score = score
             candidate = move
@@ -517,6 +529,7 @@ def _root_search(
 def get_move(fen: str, time_left_ms: int) -> str:
     board = chess.Board(fen)
     tm = TimeManager(time_left_ms, board)
+    acc_stack = AccumulatorStack(board)
 
     for k in _killers:
         k[0] = k[1] = None
@@ -554,7 +567,8 @@ def get_move(fen: str, time_left_ms: int) -> str:
             )
 
             try:
-                score, candidate = _root_search(board, moves, depth, lo, hi, tm.hard_deadline)
+                score, candidate = _root_search(board, moves, depth, lo, hi,
+                                                 tm.hard_deadline, acc_stack)
             except _Timeout:
                 timed_out = True
                 break
@@ -564,7 +578,6 @@ def get_move(fen: str, time_left_ms: int) -> str:
         if timed_out:
             break
         if candidate is not None:
-            # Extend soft deadline when the score swings sharply between depths.
             if (
                 not time_extended
                 and depth > 1
