@@ -148,6 +148,7 @@ ROOK_SEMI_OPEN_BONUS: np.int32 = np.int32(12)
 KING_PAWN_SHIELD_BONUS: np.int32 = np.int32(10)
 KING_OPEN_FILE_PENALTY: np.int32 = np.int32(20)
 MOBILITY_WEIGHT: np.int32 = np.int32(4)
+TRAPPED_MINOR_PENALTY: np.int32 = np.int32(25)
 
 FILE_MASKS: np.ndarray = np.zeros(8, dtype=np.uint64)
 for _f in range(8):
@@ -426,6 +427,8 @@ def evaluate(bbs: np.ndarray, stm: int) -> int:
 
     mob_stm = 0
     mob_opp = 0
+    trapped_stm = 0
+    trapped_opp = 0
     for _pt in range(1, 5):  # knight=1, bishop=2, rook=3, queen=4
         bb_s = bbs[stm][_pt]
         while bb_s:
@@ -439,7 +442,10 @@ def evaluate(bbs: np.ndarray, stm: int) -> int:
                 atk_s = rook_attacks_bb(sq, occupied_all)
             else:
                 atk_s = queen_attacks_bb(sq, occupied_all)
-            mob_stm += popcount(atk_s & ~stm_occ)
+            piece_mobility = popcount(atk_s & ~stm_occ)
+            mob_stm += piece_mobility
+            if _pt <= 2 and piece_mobility == 0:
+                trapped_stm += 1
             bb_s ^= lsb
         bb_o = bbs[opp][_pt]
         while bb_o:
@@ -453,9 +459,13 @@ def evaluate(bbs: np.ndarray, stm: int) -> int:
                 atk_o = rook_attacks_bb(sq, occupied_all)
             else:
                 atk_o = queen_attacks_bb(sq, occupied_all)
-            mob_opp += popcount(atk_o & ~opp_occ)
+            piece_mobility = popcount(atk_o & ~opp_occ)
+            mob_opp += piece_mobility
+            if _pt <= 2 and piece_mobility == 0:
+                trapped_opp += 1
             bb_o ^= lsb
     score += int(MOBILITY_WEIGHT) * (mob_stm - mob_opp)
+    score -= int(TRAPPED_MINOR_PENALTY) * (trapped_stm - trapped_opp)
 
     return score
 

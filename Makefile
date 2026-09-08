@@ -1,6 +1,6 @@
 SHELL := /bin/bash
 
-.PHONY: setup play arena zip gate test
+.PHONY: setup play arena zip gate test train
 
 setup:
 	uv sync
@@ -12,7 +12,7 @@ arena:
 	uv run python -m harness.arena --opponent baselines/v2 --games 20
 
 zip:
-	uv run python -m harness.package --include src
+	uv run python -m harness.package --include src --include weights
 
 test:
 	uv run python -m pytest -q
@@ -22,3 +22,8 @@ gate:
 	uv run mypy
 	uv run python -m pytest -q
 	uv run python -m harness.arena --opponent baselines/v2 --games 2 --base-ms 5000
+
+train:
+	uv run python -m train.generate_data --pgn $(PGN) --stockfish $(SF) --out train/data.npz
+	uv run python -m train.train_nnue --data train/data.npz --out train/nnue.pt
+	uv run python -m train.export_weights --checkpoint train/nnue.pt --out weights/nnue.npz
