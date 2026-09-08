@@ -27,3 +27,11 @@ def test_get_captures_includes_underpromotions() -> None:
     captures = _get_captures(board)
     promos = {m.promotion for m in captures if m.from_square == chess.A7}
     assert promos == {chess.QUEEN, chess.ROOK, chess.BISHOP, chess.KNIGHT}
+
+
+def test_see_accounts_for_immediate_recapture() -> None:
+    # White's rook takes a pawn, then black's rook can recapture it.
+    board = chess.Board("4k3/8/8/3r4/8/8/3p4/3R2K1 w - - 0 1")
+    move = chess.Move.from_uci("d1d2")
+    assert move in board.legal_moves
+    assert _see(board, move) == _PIECE_VAL[chess.PAWN] - _PIECE_VAL[chess.ROOK]

@@ -36,6 +36,7 @@ _SE_MARGIN = 50.0
 # Futility: at depth 1 only, skip quiet non-special moves when eval is far below alpha.
 _FUTILITY_MARGIN = 150       # centipawns — one pawn and a bit of tempo
 _DELTA_MARGIN = 200          # quiescence delta pruning buffer
+_QUIESCENCE_CHECK_DEPTH = 1
 _INSTABILITY_THRESHOLD = 30.0  # cp swing between depths that triggers a time extension
 _INSTABILITY_FACTOR = 1.5
 
@@ -122,6 +123,31 @@ def _get_captures(board: chess.Board) -> list[chess.Move]:
         m for m in candidates
         if board.is_legal(m) and (board.is_capture(m) or m.promotion is not None)
     ]
+
+
+def _get_tactical_moves(
+    board: chess.Board, include_checks: bool,
+) -> tuple[list[chess.Move], frozenset[int]]:
+    """Return legal captures, promotions, and optionally quiet checks in one generation pass.
+
+    Also returns the id()s of the quiet-check moves — computing gives_check() again for
+    captures/promotions in the caller would double the (expensive) check-detection cost
+    on the moves that dominate quiescence node counts, for a flag those moves barely need.
+    """
+    bbs, stm = encode(board)
+    ep_sq = board.ep_square if board.ep_square is not None else -1
+    candidates = generate_pseudo_legal(bbs, stm, ep_sq, board.castling_rights)
+    moves: list[chess.Move] = []
+    quiet_check_ids: set[int] = set()
+    for move in candidates:
+        if not board.is_legal(move):
+            continue
+        if board.is_capture(move) or move.promotion is not None:
+            moves.append(move)
+        elif include_checks and board.gives_check(move):
+            moves.append(move)
+            quiet_check_ids.add(id(move))
+    return moves, frozenset(quiet_check_ids)
 
 
 def _move_score(
@@ -216,7 +242,9 @@ def _see(board: chess.Board, move: chess.Move) -> int:
         occ ^= 1 << sq
         is_white = not is_white
 
-    for i in range(len(gain) - 2, 0, -1):
+    # Propagate all the way back to gain[0]. Omitting index 0 makes a capture
+    # look profitable even when the opponent can immediately recapture it.
+    for i in range(len(gain) - 1, 0, -1):
         gain[i - 1] = -max(-gain[i - 1], gain[i])
 
     return gain[0]
@@ -237,6 +265,7 @@ def quiesce(
     deadline: float,
     ply: int,
     acc_stack: AccumulatorStack,
+    qdepth: int = 0,
 ) -> float:
     """Capture search until quiet. Fixes the horizon effect."""
     if time.monotonic() >= deadline:
@@ -257,15 +286,35 @@ def quiesce(
             alpha = stand_pat
         if stand_pat + _MAX_GAIN < alpha:
             return alpha
-        # SEE filter and sort: skip losing captures (except promotions — rare and tactically
-        # important enough to always search), order winning ones first.
-        all_captures = _get_captures(board)
-        see_scores = {id(m): _see(board, m) for m in all_captures}
-        moves = [m for m in all_captures if see_scores[id(m)] >= 0 or m.promotion is not None]
-        moves.sort(key=lambda m: see_scores[id(m)], reverse=True)
+        # Search captures and checks. Quiet checks are essential here: otherwise a
+        # mate in one at the leaf is invisible until the next full-width iteration.
+        # Bounded by qdepth (plies into *this* quiescence recursion), not ply (plies
+        # from the root) — ply is shared with mate-distance scoring, so re-using it
+        # here let every leaf of the main tree re-open a fresh multi-ply check chase,
+        # which blew up node counts by 3-4x and cost a full ply of search depth.
+        checks = qdepth < _QUIESCENCE_CHECK_DEPTH
+        moves, quiet_check_ids = _get_tactical_moves(board, checks)
+        check_scores = {id(m): id(m) in quiet_check_ids for m in moves}
+        see_scores = {
+            id(m): _see(board, m) if board.is_capture(m) or m.promotion is not None else 0
+            for m in moves
+        }
+
+        # Losing captures can be omitted, but never omit promotions or checks.
+        moves = [
+            m for m in moves
+            if see_scores[id(m)] >= 0
+            or m.promotion is not None
+            or check_scores[id(m)]
+        ]
+        moves.sort(
+            key=lambda m: (check_scores[id(m)], see_scores[id(m)]),
+            reverse=True,
+        )
 
     for move in moves:
         if not in_check_now:
+            gives_check = check_scores[id(move)]
             victim = board.piece_type_at(move.to_square)
             if victim is not None:
                 victim_val = _PIECE_VAL[victim]
@@ -275,11 +324,11 @@ def quiesce(
                 victim_val = 0
             if move.promotion is not None:
                 victim_val += _PIECE_VAL[move.promotion] - _PIECE_VAL[chess.PAWN]
-            if stand_pat + victim_val + _DELTA_MARGIN < alpha:
+            if not gives_check and stand_pat + victim_val + _DELTA_MARGIN < alpha:
                 continue
         acc_stack.push(move, board)
         board.push(move)
-        score = -quiesce(board, -beta, -alpha, deadline, ply + 1, acc_stack)
+        score = -quiesce(board, -beta, -alpha, deadline, ply + 1, acc_stack, qdepth + 1)
         board.pop()
         acc_stack.pop()
         if score >= beta:
