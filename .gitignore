@@ -6,3 +6,5 @@ submission.zip
 *.pgn
 train/data.npz
 train/nnue.pt
+train/.venv-gpu/
+train/*.log

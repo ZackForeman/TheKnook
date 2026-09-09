@@ -27,6 +27,7 @@ def _parse_args() -> argparse.Namespace:
     p.add_argument("--depth", type=int, default=12)
     p.add_argument("--out", default="train/data.npz")
     p.add_argument("--limit", type=int, default=500_000, help="Max positions to collect")
+    p.add_argument("--samples-per-game", type=int, default=8, help="Quiet positions per game")
     p.add_argument("--seed", type=int, default=42)
     return p.parse_args()
 
@@ -65,7 +66,7 @@ def main() -> None:
                 if _is_quiet(board):
                     positions.append(board.fen())
 
-            sample = rng.sample(positions, min(8, len(positions)))
+            sample = rng.sample(positions, min(args.samples_per_game, len(positions)))
             for fen in sample:
                 b = chess.Board(fen)
                 info = engine.analyse(b, limit)

@@ -2,7 +2,7 @@
 
 Architecture (chess HalfKP):
   Features per perspective: 64 king_sq x 10 (5 piece_types x 2 colours) x 64 sq = 40 960
-  L1 accumulator: (2, N1) = (2, 256) float32  — one per side, shared W1/b1
+  L1 accumulator: (2, N1) = (2, 16) float32  — one per side, shared W1/b1
   L2-L4: [512 → 32 → 32 → 1] with clipped-ReLU after L2 and L3
   Output: centipawns from side-to-move perspective
 """
@@ -20,7 +20,12 @@ from .bitboard import encode
 # ---------------------------------------------------------------------------
 # Hyper-parameters (must match training config exactly)
 # ---------------------------------------------------------------------------
-N1: int = 256  # accumulator width per side; L2 input is 2*N1 = 512
+N1: int = 16  # accumulator width per side; L2 input is 2*N1 = 32
+# The network is trained against cp / _SCORE_SCALE (see train/train_nnue.py) because
+# its clamp(0, 1) hidden activations bound the raw output to a small range near its
+# init scale — reaching real centipawn magnitudes directly would need an impractical
+# number of training steps. Undo that scaling here to get centipawns back out.
+_SCORE_SCALE: float = 400.0
 
 # ---------------------------------------------------------------------------
 # Weight loading
@@ -313,7 +318,7 @@ def nnue_evaluate(board: chess.Board, acc_stack: AccumulatorStack) -> int:
     """Return NNUE centipawn score from side-to-move perspective."""
     stm = 0 if board.turn == chess.WHITE else 1
     acc = acc_stack.get_or_refresh(board)
-    return int(nnue_forward(acc, stm, _W2, _b2, _W3, _b3, _W4, _b4))
+    return int(nnue_forward(acc, stm, _W2, _b2, _W3, _b3, _W4, _b4) * _SCORE_SCALE)
 
 
 # ---------------------------------------------------------------------------

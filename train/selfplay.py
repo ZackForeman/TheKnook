@@ -31,6 +31,8 @@ DEFAULT_AGENTS = [
     "baselines/numba",
     "baselines/random",
     "baselines/v1",
+    "baselines/v2",
+    "baselines/v3",
     ".",
 ]
 

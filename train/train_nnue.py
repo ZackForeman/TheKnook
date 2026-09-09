@@ -24,8 +24,14 @@ from torch.utils.data import DataLoader, Dataset
 # ---------------------------------------------------------------------------
 # HalfKP feature extraction (mirrors src/nnue.py logic, pure Python for training)
 # ---------------------------------------------------------------------------
-_N1 = 256
+_N1 = 16
 _FEAT = 40_960  # 64 king_sq x 10 piece/colour x 64 sq
+# forward()'s three clamp(0, 1) activations bound the network's raw output to a small
+# range near its init scale; reaching raw centipawn magnitudes (targets run to ~+-2000)
+# would need an impractical number of steps for the last layer's weights to grow that
+# large. Train against cp / _SCORE_SCALE instead, and multiply back up at inference
+# (src/nnue.py's nnue_evaluate) — this constant must match there exactly.
+_SCORE_SCALE = 400.0
 
 
 def _halfkp_indices(board: chess.Board, perspective: int) -> list[int]:
@@ -68,9 +74,10 @@ class HalfKPDataset(Dataset[tuple[list[int], list[int], float]]):
         stm = 0 if board.turn == chess.WHITE else 1
         idx0 = _halfkp_indices(board, 0)
         idx1 = _halfkp_indices(board, 1)
-        # Score is from white's perspective; convert to stm perspective
+        # Score is from white's perspective; convert to stm perspective, then to the
+        # network's trained output scale.
         cp = self.scores[idx] if stm == 0 else -self.scores[idx]
-        return idx0, idx1, cp
+        return idx0, idx1, cp / _SCORE_SCALE
 
 
 def _flatten(indices: list[list[int]]) -> tuple[torch.Tensor, torch.Tensor]:
@@ -111,12 +118,20 @@ class NNUE(nn.Module):
         self._init_weights()
 
     def _init_weights(self) -> None:
-        # Small per-feature scale since ~15-30 active features get summed into each
-        # accumulator slot. l2-l4 keep torch's default fan-in-scaled init: overriding
-        # them to the same small std as ft compounds across 3 layers and collapses the
-        # output to near-zero regardless of input (verified: pred std ~1e-6 with a
-        # flat std=0.01 on every layer, vs. a healthy range once only ft is scaled down).
-        nn.init.normal_(self.ft.weight, std=0.01)
+        # clamp(0, 1) after every layer has zero gradient outside that window, so a unit
+        # whose pre-activation lands outside it at init is dead forever — gradient descent
+        # can never pull it back. With ~15-30 active features summed per accumulator slot,
+        # a small (e.g. std=0.01) embedding init keeps the pre-clamp distribution far too
+        # narrow relative to [0, 1]: it's centered at 0, so ~50% of units start negative
+        # and die immediately (verified empirically: 42-59% dead per layer at init, and
+        # training never recovered past that regardless of data volume, weight decay, or
+        # model width — all three were tried and ruled out before finding this).
+        # A wider embedding std plus a mid-window bias keeps the pre-clamp distribution
+        # centered inside (0, 1) with most of its spread away from either clamp edge.
+        nn.init.normal_(self.ft.weight, std=0.05)
+        nn.init.constant_(self.b1, 0.5)
+        nn.init.constant_(self.l2.bias, 0.5)
+        nn.init.constant_(self.l3.bias, 0.5)
 
     def accumulate(self, flat_indices: torch.Tensor, offsets: torch.Tensor) -> torch.Tensor:
         """Sum feature embeddings (= W1 row-sum per sample) + bias."""
@@ -149,6 +164,13 @@ def _parse_args() -> argparse.Namespace:
     p.add_argument("--lr", type=float, default=1e-3)
     p.add_argument("--val-frac", type=float, default=0.05)
     p.add_argument("--seed", type=int, default=0)
+    p.add_argument("--workers", type=int, default=0,
+                    help="DataLoader worker processes for feature extraction")
+    p.add_argument("--weight-decay", type=float, default=1e-4,
+                    help="AdamW weight decay; the main lever against embedding-table "
+                         "overfitting when active features touch most rows only a few times")
+    p.add_argument("--patience", type=int, default=10,
+                    help="Stop after this many epochs with no val improvement")
     return p.parse_args()
 
 
@@ -169,17 +191,20 @@ def main() -> None:
     val_ds = HalfKPDataset([fens[i] for i in val_idx], [scores[i] for i in val_idx])
 
     train_dl = DataLoader(train_ds, batch_size=args.batch, shuffle=True,
-                          collate_fn=_collate, num_workers=0)
+                          collate_fn=_collate, num_workers=args.workers,
+                          persistent_workers=args.workers > 0)
     val_dl = DataLoader(val_ds, batch_size=args.batch, shuffle=False,
-                        collate_fn=_collate, num_workers=0)
+                        collate_fn=_collate, num_workers=args.workers,
+                        persistent_workers=args.workers > 0)
 
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     model = NNUE().to(device)
-    opt = torch.optim.Adam(model.parameters(), lr=args.lr)
+    opt = torch.optim.AdamW(model.parameters(), lr=args.lr, weight_decay=args.weight_decay)
     scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(opt, T_max=args.epochs)
     loss_fn = nn.MSELoss()
 
     best_val = float("inf")
+    epochs_without_improvement = 0
     out_path = Path(args.out)
     out_path.parent.mkdir(parents=True, exist_ok=True)
 
@@ -206,13 +231,22 @@ def main() -> None:
 
         train_mse = total_loss / len(train_ds)
         val_mse = val_loss / len(val_ds)
-        print(f"epoch {epoch:>3}  train={train_mse:.1f}  val={val_mse:.1f}")
+        # Reported in cp^2 (undoing _SCORE_SCALE) so the printed MSE is interpretable;
+        # the comparison below stays in the network's native (scaled) units.
+        cp2 = _SCORE_SCALE ** 2
+        print(f"epoch {epoch:>3}  train={train_mse * cp2:.1f}  val={val_mse * cp2:.1f}")
 
         if val_mse < best_val:
             best_val = val_mse
+            epochs_without_improvement = 0
             torch.save(model.state_dict(), out_path)
+        else:
+            epochs_without_improvement += 1
+            if epochs_without_improvement >= args.patience:
+                print(f"no val improvement in {args.patience} epochs, stopping early")
+                break
 
-    print(f"best val MSE={best_val:.1f}, saved → {out_path}")
+    print(f"best val MSE={best_val * _SCORE_SCALE ** 2:.1f}, saved → {out_path}")
 
 
 if __name__ == "__main__":

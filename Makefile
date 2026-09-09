@@ -1,6 +1,6 @@
 SHELL := /bin/bash
 
-.PHONY: setup play arena zip gate test train
+.PHONY: setup play arena zip gate test train selfplay train-gpu-setup train-gpu
 
 setup:
 	uv sync
@@ -26,4 +26,18 @@ gate:
 train:
 	uv run python -m train.generate_data --pgn $(PGN) --stockfish $(SF) --out train/data.npz
 	uv run python -m train.train_nnue --data train/data.npz --out train/nnue.pt
+	uv run python -m train.export_weights --checkpoint train/nnue.pt --out weights/nnue.npz
+
+selfplay:
+	uv run python -m train.selfplay --games-per-pair $(if $(GPP),$(GPP),20) --out train/selfplay.pgn
+
+train-gpu-setup:
+	uv venv train/.venv-gpu --python 3.12
+	uv pip install --python train/.venv-gpu/bin/python torch==2.6.0 --index-url https://download.pytorch.org/whl/cu124
+	uv pip install --python train/.venv-gpu/bin/python numpy==2.5.2 chess==1.11.2
+
+train-gpu:
+	uv run python -m train.generate_data --pgn train/selfplay.pgn --stockfish /usr/games/stockfish \
+	    --samples-per-game 16 --limit 200000 --out train/data.npz
+	train/.venv-gpu/bin/python -m train.train_nnue --data train/data.npz --out train/nnue.pt --workers 6
 	uv run python -m train.export_weights --checkpoint train/nnue.pt --out weights/nnue.npz
