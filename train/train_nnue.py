@@ -72,12 +72,19 @@ class HalfKPDataset(Dataset[tuple[list[int], list[int], float]]):
     def __getitem__(self, idx: int) -> tuple[list[int], list[int], float]:
         board = chess.Board(self.fens[idx])
         stm = 0 if board.turn == chess.WHITE else 1
-        idx0 = _halfkp_indices(board, 0)
-        idx1 = _halfkp_indices(board, 1)
+        # perspective 0/1 are always White's-king-view / Black's-king-view (absolute,
+        # matching src/nnue.py's refresh_accumulator) — NOT stm/opp. Whichever one
+        # corresponds to the side actually on move must be selected as idx_stm here;
+        # returning them unconditionally as (idx0, idx1) fed White's-view features as
+        # "stm" for every Black-to-move position (~50% of the data), scrambling the
+        # input/output pairing against the stm-relative target score below.
+        idx_white = _halfkp_indices(board, 0)
+        idx_black = _halfkp_indices(board, 1)
+        idx_stm, idx_opp = (idx_white, idx_black) if stm == 0 else (idx_black, idx_white)
         # Score is from white's perspective; convert to stm perspective, then to the
         # network's trained output scale.
         cp = self.scores[idx] if stm == 0 else -self.scores[idx]
-        return idx0, idx1, cp / _SCORE_SCALE
+        return idx_stm, idx_opp, cp / _SCORE_SCALE
 
 
 def _flatten(indices: list[list[int]]) -> tuple[torch.Tensor, torch.Tensor]:
